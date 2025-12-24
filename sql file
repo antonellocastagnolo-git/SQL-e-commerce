@@ -1,0 +1,288 @@
+SHOW events;
+
+
+CREATE TABLE IF NOT EXISTS magazzino(
+prod_id  INT AUTO_INCREMENT PRIMARY KEY,
+nome_prodotto VARCHAR(100),
+prezzo DECIMAL(8,2),
+in_stock INT
+);
+
+CREATE TABLE IF NOT EXISTS ordini_ex (
+ord_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+prod_id INT,
+quantità SMALLINT,
+data_ordine TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+FOREIGN KEY (prod_id) REFERENCES magazzino(prod_id) ON DELETE CASCADE
+);
+
+ALTER TABLE ordini_ex
+MODIFY COLUMN data_ordine TYPE DATETIME DEFAULT CURRENT_DATE; -- rivedere come si modifica una col in mysql
+
+SELECT CURRENT_DATE;
+SELECT now();
+SELECT CURRENT_TIMESTAMP;
+
+INSERT INTO magazzino(nome_prodotto,prezzo,in_stock) VALUES -- ok cosi per l insert values
+('frigo', 250, 45),
+('tv oled', 1350, 100);
+DELETE from magazzino;
+
+
+INSERT INTO ordini_ex(prod_id,quantità,data_ordine) VALUES
+(1,4,'2025-11-26'),
+(2,5,'2025-11-26'),
+(1,2,'2025-11-26'),
+(2,8,'2025-11-26');
+
+-- prova ulteriore ordine per vedere se funziona il TRIGGER
+INSERT INTO ordini_ex(prod_id,quantità,data_ordine) VALUES
+(1,1,'2025-11-26'),
+(2,6,'2025-11-26');
+
+SELECT * FROM ordini_ex;
+
+SELECT  m.nome_prodotto,
+cast((SUM(o.quantità * m.prezzo)) as unsigned)  as revenue -- unsigned per ottenere un INT
+FROM magazzino m 
+LEFT JOIN ordini_ex o ON m.prod_id = o.prod_id
+GROUP BY m.nome_prodotto ORDER BY revenue DESC;
+
+
+-- ora devi creare il trigger che fa scalare la quantità del magazzino dopo aver ricevuto un ordine
+
+SHOW TRIGGERS;
+SHOW EVENTS;
+
+DROP TRIGGER update_magazzino;
+
+
+-- trigger che fa diminuire le quantità in stock
+CREATE TRIGGER update_magazzino -- ok non serve il DELIMITER
+AFTER INSERT ON ordini_ex
+FOR EACH ROW
+UPDATE magazzino
+SET in_stock = in_stock - NEW.quantità
+WHERE prod_id = NEW.prod_id;
+
+
+/* trigger complesso -- FOR UPDATE serve a impedire la race condition
+-- controlla se la quantità disponibile è maggiore della quantità ordinata
+-- se sì, aggiorna la riga del magazzino
+-- se no, blocca tutto
+-- qui si usa il DELIMITER poichè ci sono più istruzioni
+*/ 
+DELIMITER $$
+
+CREATE TRIGGER aggiorna_magazzino_con_controllo
+AFTER INSERT ON ordini_ex
+FOR EACH ROW 
+BEGIN
+    DECLARE quantita_disponibile INT DEFAULT 0;
+
+    -- Read current stock with row lock
+    SELECT in_stock INTO quantita_disponibile 
+    FROM magazzino 
+    WHERE prod_id = NEW.prod_id 
+    FOR UPDATE;
+
+    -- Check stock availability
+    IF quantita_disponibile >= NEW.quantità THEN
+        -- Reduce stock
+        UPDATE magazzino 
+        SET in_stock = in_stock - NEW.quantità
+        WHERE prod_id = NEW.prod_id;
+    ELSE
+        -- Raise error if insufficient stock
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = 'Stock insufficiente per il prodotto richiesto';
+    END IF;
+END$$
+
+DELIMITER ;   
+
+SHOW TRIGGERS ;
+DROP TRIGGER update_magazzino;
+
+-- prova ulteriore ordine per vedere se funziona il TRIGGER
+INSERT INTO ordini_ex(prod_id,quantità,data_ordine) VALUES
+(1,11,'2025-11-26'),
+(2,6,'2025-11-26');
+
+SELECT * FROM magazzino WHERE prod_id = 1;
+SELECT * FROM ordini_ex;
+
+INSERT INTO ordini_ex (prod_id, quantità) VALUES (1, 1);   
+
+
+-- per gestire bene ora il MAGAZZINO e i RIFORNIMENTI
+-- posso
+
+-- 1)Creare una tabella per gli ordini ai fornitori:
+CREATE TABLE ordini_fornitore (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    prod_id INT,
+    quantita_ordine INT,
+    data_ordine DATETIME,
+    FOREIGN KEY (prod_id) REFERENCES magazzino(prod_id)
+);   
+-- 2) Aggiungere una colonna soglia_minima nella tabella magazzino:
+ALTER TABLE magazzino ADD COLUMN soglia_minima INT DEFAULT 10;   
+
+-- 3)Creare un trigger che verifica la soglia dopo l'aggiornamento dello stock:
+DELIMITER $$
+
+CREATE TRIGGER verifica_soglia_fornitore
+AFTER UPDATE ON magazzino
+FOR EACH ROW 
+BEGIN
+    -- Se lo stock scende sotto la soglia E non c'è già un ordine in attesa
+    IF NEW.in_stock < NEW.soglia_minima AND NOT NEW.ordine_fornitore_in_attesa THEN
+        
+        -- Imposta il flag a TRUE
+        UPDATE magazzino 
+        SET ordine_fornitore_in_attesa = TRUE 
+        WHERE prod_id = NEW.prod_id;
+        
+        -- Inserisci l'ordine al fornitore
+        INSERT INTO ordini_fornitore (prod_id, quantita_ordine, data_ordine)
+        VALUES (NEW.prod_id, NEW.soglia_minima * 3, NOW());
+        
+    END IF;
+END$$
+
+DELIMITER ;
+
+-- ora ricontrolla tutto
+
+SHOW TRIGGERS ;
+DROP TRIGGER verifica_soglia_fornitore; -- devo usare una STORED PROCEDURE per UPDATE su tabelle che subiscono
+-- altri UPDATE da altri TRIGGER
+
+-- prova ulteriore ordine per vedere se funziona il TRIGGER
+INSERT INTO ordini_ex(prod_id,quantità,data_ordine) VALUES
+(1,15,now()),
+(2,6,now());
+
+
+-- devo aggiungere la colonna status alla tabella ORDINI_FORNITORE
+-- bene, ora un altro TRIGGER
+-- dopo aver ricevuto un ORDINE DAL FORNITORE
+-- (mettere un timer)
+-- rifocillare il MAGAZZINO delle nuove scorte arrivate
+
+ALTER TABLE ordini_fornitore ADD COLUMN status ENUM('shipped','delivered');
+ALTER TABLE magazzino ADD COLUMN ordine_fornitore_in_attesa BOOLEAN DEFAULT FALSE;   
+
+
+-- STORED PROCEDURE
+DELIMITER $$
+
+CREATE PROCEDURE InserisciOrdineFornitore(IN prod_id INT)
+BEGIN
+    DECLARE soglia INT;
+    
+    -- Legge la soglia e lo stato
+    SELECT soglia_minima INTO soglia 
+    FROM magazzino WHERE prod_id = prod_id FOR UPDATE;
+    
+    -- Inserisce l'ordine solo se non c'è già un ordine in attesa
+    IF NOT (SELECT ordine_fornitore_in_attesa FROM magazzino WHERE prod_id = prod_id) THEN
+        
+        INSERT INTO ordini_fornitore (prod_id, quantita_ordine, data_ordine)
+        VALUES (prod_id, soglia * 2, NOW());
+        
+        -- Ora aggiorna il flag (permesso perché in procedura, non in trigger)
+        UPDATE magazzino 
+        SET ordine_fornitore_in_attesa = TRUE 
+        WHERE prod_id = prod_id;
+        
+    END IF;
+END$$
+
+DELIMITER ;   
+
+
+CREATE TRIGGER verifica_soglia_fornitore
+AFTER UPDATE ON magazzino
+FOR EACH ROW 
+BEGIN
+    IF NEW.in_stock < NEW.soglia_minima AND NOT NEW.ordine_fornitore_in_attesa THEN
+        CALL InserisciOrdineFornitore(NEW.prod_id);
+    END IF;
+END;   
+
+
+SHOW TRIGGERS; 
+
+-- crea comunque conflitti fra trigger -- per evitarlo , fai partire uno scheduled event in cui richiami
+-- uno stored_procedure
+
+
+
+-- Enable event scheduler
+SET GLOBAL event_scheduler = ON;
+
+SHOW events;
+SHOW triggers ;
+-- Create event that runs every 5 minutes
+CREATE EVENT IF NOT EXISTS controllo_soglia_fornitore
+ON SCHEDULE EVERY 2 SECOND
+DO
+BEGIN
+    INSERT INTO ordini_fornitore (prod_id, quantita_ordine, data_ordine)
+    SELECT 
+        m.prod_id,
+        m.soglia_minima * 3,
+        NOW()
+    FROM magazzino m
+    WHERE m.in_stock < m.soglia_minima
+      AND NOT m.ordine_fornitore_in_attesa
+      AND NOT EXISTS (
+          SELECT 1 FROM ordini_fornitore f 
+          WHERE f.prod_id = m.prod_id 
+            AND f.data_ordine >= NOW() - INTERVAL 1 HOUR
+      );
+
+    -- Set flag for products that just triggered an order
+    UPDATE magazzino
+    SET ordine_fornitore_in_attesa = TRUE
+    WHERE in_stock < soglia_minima
+      AND NOT ordine_fornitore_in_attesa;
+END;   
+
+
+ALTER TABLE ordini_fornitore
+DROP COLUMN status;
+ALTER TABLE ordini_fornitore
+ADD COLUMN status ENUM('pending','delivered') DEFAULT 'pending';
+
+
+-- aggiungi al magazzino la quantità ricevuta dal fornitore
+DELIMITER $$
+
+CREATE TRIGGER aggiorna_magazzino_da_ordine_fornitore
+AFTER UPDATE ON ordini_fornitore
+FOR EACH ROW 
+BEGIN
+    IF NEW.status = 'delivered' AND OLD.status = 'pending' THEN
+        UPDATE magazzino 
+        SET in_stock = in_stock + NEW.quantita_ordine,
+            ordine_fornitore_in_attesa = FALSE
+        WHERE prod_id = NEW.prod_id;
+    END IF;
+END$$
+
+DELIMITER ;   
+
+SHOW TRIGGERS ;
+SHOW EVENTS;
+-- bene, ora manca una tabella WEEKLY SALES, SPENDING REVIEWS
+
+
+
+SELECT DATE_FORMAT((NOW() - INTERVAL 10 DAY),'%d-%m-%Y %H:%m:%s') as data_italiana ;
+
+
+SELECT * FROM dreams 
+WHERE LIMIT IS NULL;
